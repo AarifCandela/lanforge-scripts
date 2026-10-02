@@ -432,7 +432,21 @@ def main():
     o.add_argument("--duration", type=int, default=0)
 
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--help_summary", action="store_true",
+                   help="Show summary of what this script does")
     args = p.parse_args()
+
+    help_summary = '''\
+lf_fg_pcap.py creates and drives Layer-3 custom_ether cross-connects on LANforge
+monitor ports to replay pcap files or preset 802.11 frames (rts/cts/ack/deauth/
+disassociate/probe-request/beacon/custom hex) over the air -- the Frame Generator
+path. Actions: create_monitor, build_pcap_cx, start_cx, stop_cx, del_cx,
+cx_status, ports_up, ports_down. Radiotap MCS parity is applied (mcs_index and
+bandwidth) so sniffer decodes match the configured rate.
+'''
+    if args.help_summary:
+        print(help_summary)
+        exit(0)
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(levelname)s %(message)s")
