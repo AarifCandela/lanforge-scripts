@@ -166,13 +166,23 @@ def build_frame(kind, spec):
     return struct.pack("<HH", fc, dur) + da + sa + bssid + frag_seq + reason
 
 
-def radiotap_header(rate_mbps=24.0):
-    """OTA-proven inject shape: FLAGS|TX_FLAGS|RATE, no channel field, no-ACK.
-    (Radiotap headers carrying a CHANNEL field failed to radiate on mt76
-    monitors during validation.)"""
-    present = (1 << 1) | (1 << 15) | (1 << 2)
-    rate_u = max(1, int(round(rate_mbps * 2)))
-    body = struct.pack("<BBH", 0x00, rate_u, 0x0008)
+def radiotap_header(rate_mbps=24.0, mcs_index=None, width_mhz=20):
+    """OTA-proven inject shape: FLAGS|TX_FLAGS(|RATE or |MCS), no channel
+    field, no-ACK. (Radiotap headers carrying a CHANNEL field failed to
+    radiate on mt76 monitors during validation; this exact shape was
+    OTA-verified 20/20.)"""
+    present = (1 << 1) | (1 << 15)  # FLAGS | TX_FLAGS
+    if mcs_index is not None:
+        present |= 1 << 29  # MCS
+        # mcs field: known(3) flags(1) mcs(1)
+        known = {20: 0x00, 40: 0x01, 80: 0x04, 160: 0x08}.get(width_mhz, 0x00)
+        body = struct.pack("<BBBB", 0x03, 0x00, known, mcs_index & 0xFF)
+    else:
+        present |= 1 << 2  # RATE (500 kbps units)
+        rate_u = max(1, int(round(rate_mbps * 2)))
+        if rate_u > 255:
+            raise ValueError("legacy rate must be <= 127.5 Mbps")
+        body = struct.pack("<BBH", 0x00, rate_u, 0x0008)  # flags, rate, TX-flags: no-ACK
     hdr_len = 8 + len(body)
     return struct.pack("<BBHI", 0, 0, hdr_len, present) + body
 
