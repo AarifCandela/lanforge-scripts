@@ -56,13 +56,19 @@ CAPTURE_LUA = r'''
 -- Export TShark's decrypted data source; never implement cryptography here.
 local wlan = Field.new("wlan")
 local llc = Field.new("llc")
+local management = Field.new("wlan.mgt")
+local frame_type = Field.new("wlan.fc.type")
 local ccmp = Field.new("wlan.ccmp.extiv")
 local flags = Field.new("radiotap.flags")
 local fcs = Field.new("wlan.fcs")
-local listener = Listener.new("frame", "wlan.fc.type == 2 && wlan.fc.protected == 1 && llc", true)
+local listener = Listener.new("frame",
+    "wlan.fc.protected == 1 && ((wlan.fc.type == 2 && llc) || (wlan.fc.type == 0 && wlan.mgt))", true)
 io.write("LF_WIFI_PLAINTEXT_V1\n")
 local function export_packet(pinfo, tvb)
     local w, l, c, f, checksum = wlan(), llc(), ccmp(), flags(), fcs()
+    -- Unicast PMF uses the station's temporal key. Its decrypted body is
+    -- exposed through wlan.mgt rather than LLC; group BIP is not encrypted.
+    if tonumber(frame_type().value) == 0 then l = management() end
     if w and l and c and c.len == 8 and l.source and l.source ~= tvb
             and w.source == tvb and c.source == tvb then
         if checksum and checksum.len ~= 4 then return end
@@ -475,7 +481,9 @@ class MemoryFrameStore:
 
     def add_capture(self, number, metadata, batch):
         row = self.decoded.get(number)
-        if row is not None and not row[0] and row[1] == batch:
+        # Management bodies have no LLC record. Their first successful Lua
+        # export owns the frame; data keeps the owner selected by scan().
+        if row is None or (not row[0] and row[1] == batch):
             self.capture.setdefault(number, metadata)
 
     def iter_capture(self):
@@ -556,7 +564,7 @@ class SqliteFrameStore:
     def add_capture(self, number, metadata, batch):
         self.database.execute(
             "INSERT OR IGNORE INTO capture SELECT ?, ?, ?, ?, ?, ?, ? "
-            "WHERE EXISTS(SELECT 1 FROM decoded WHERE frame = ? AND owner = ? AND baseline = 0)",
+            "WHERE NOT EXISTS(SELECT 1 FROM decoded WHERE frame = ? AND (owner != ? OR baseline = 1))",
             (number, *metadata, number, batch),
         )
 
@@ -587,12 +595,12 @@ def scan(tshark, pcap, env, timeout, store, batch, secrets):
     count as new successes. Frame-number keys deduplicate results across passes.
     """
     command = base_command(tshark, pcap, batch is not None)
-    command += ["-Y", "eapol || (wlan.fc.type == 2 && wlan.fc.protected == 1)",
+    command += ["-Y", "eapol || ((wlan.fc.type == 2 || wlan.fc.type == 0) && wlan.fc.protected == 1)",
                 "-T", "fields", "-E", "occurrence=f"]
     for field in SCAN_FIELDS:
         command += ["-e", field]
     counts = Counter(eapol=0, protected_data=0, protected_unicast=0,
-                     protected_group=0, decoded_protected_llc=0)
+                     protected_group=0, decoded_protected_llc=0, protected_management=0)
     with packet_buffer(store) as output:
         run_checked(command, env, timeout, secrets, output)
         output.seek(0)
@@ -608,7 +616,12 @@ def scan(tshark, pcap, env, timeout, store, batch, secrets):
                 if "eapol" in protocols:
                     counts["eapol"] += 1
                     store.add_eapol(number)
-                if protected.lower() not in ("1", "true") or frame_type != "2":
+                if protected.lower() not in ("1", "true"):
+                    continue
+                if frame_type == "0":
+                    counts["protected_management"] += 1
+                    continue
+                if frame_type != "2":
                     continue
                 counts["protected_data"] += 1
                 if receiver:
@@ -707,7 +720,7 @@ def render_batch(tshark, pcap, env, timeout, store, batch, mode,
 def collect_plaintext(tshark, pcap, root, env, timeout, store, batch, secrets):
     """Keep complete decrypted payloads only from each frame's successful batch.
 
-    Lua reads the decrypted Tvb that TShark used for LLC dissection. The
+    Lua reads the decrypted Tvb used for LLC or management dissection. The
     output stays in the selected packet buffer: RAM for memory mode, a
     temporary file for SQLite. A completion marker detects script failures.
     """
@@ -753,10 +766,13 @@ def rebuild_wlan_frame(packet, linktype, metadata):
     if not (0 <= wlan_offset <= crypto_offset <= len(packet)) or crypto_offset < wlan_offset + 24:
         raise RuntimeError("Invalid 802.11 header boundaries in plaintext export.")
     fc0, fc1 = packet[wlan_offset:wlan_offset + 2]
-    if (fc0 & 15) != 8 or not (fc1 & 64):
-        raise RuntimeError("Plaintext export does not identify a protected data frame.")
+    frame_type = fc0 & 15
+    if frame_type not in (0, 8) or not (fc1 & 64):
+        raise RuntimeError("Plaintext export does not identify protected data or management.")
+    if frame_type == 0 and (packet[wlan_offset + 4] & 1 or crypto_offset != wlan_offset + 24):
+        return None, "unsupported management header"
     if fc1 & 4 or packet[wlan_offset + 22] & 15:
-        return None, "fragmented data"
+        return None, "fragmented data" if frame_type == 8 else "fragmented management"
     if flags_offset != -1 and not 0 <= flags_offset < wlan_offset:
         raise RuntimeError("Invalid radiotap flags offset in plaintext export.")
     flags = packet[flags_offset] if flags_offset >= 0 else 0
@@ -774,8 +790,8 @@ def rebuild_wlan_frame(packet, linktype, metadata):
             header[flags_offset] &= ~64  # The replacement FCS is valid.
     crc_header = bytes(header[wlan_offset:])
     if flags & 32:
-        qos = bool(fc0 & 128)
-        mac_length = 24 + (6 if fc1 & 3 == 3 else 0) + (2 if qos else 0) + (4 if qos and fc1 & 128 else 0)
+        qos = frame_type == 8 and bool(fc0 & 128)
+        mac_length = 24 + (6 if frame_type == 8 and fc1 & 3 == 3 else 0) + (2 if qos else 0) + (4 if qos and fc1 & 128 else 0)
         if crypto_offset - wlan_offset != ((mac_length + 3) & ~3):
             return None, "unsupported padded MAC header"
         crc_header = bytes(header[wlan_offset:wlan_offset + mac_length])
@@ -911,7 +927,8 @@ def write_capture(pcap, path, store, digest):
     path.parent.mkdir(parents=True, exist_ok=True)
     payloads = iter(store.iter_capture())
     pending = next(payloads, None)
-    stats = {"frames_written": 0, "frames_decrypted": 0, "skipped": Counter()}
+    stats = {"frames_written": 0, "frames_decrypted": 0, "data_frames_decrypted": 0,
+             "management_frames_decrypted": 0, "skipped": Counter()}
 
     def rewrite(packet, wirelen, linktype):
         nonlocal pending
@@ -931,6 +948,7 @@ def write_capture(pcap, path, store, digest):
             stats["skipped"][reason] += 1
             return packet, wirelen
         stats["frames_decrypted"] += 1
+        stats["management_frames_decrypted" if (packet[metadata[0]] & 12) == 0 else "data_frames_decrypted"] += 1
         return replacement, wirelen + len(replacement) - len(packet)
 
     temporary = None
@@ -1072,7 +1090,9 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                 count = store.decoded_count()
                 # Stop only after all counted protected data is readable.
                 # Otherwise later batches may hold keys for older/newer sessions.
-                if before["protected_data"] and count == before["protected_data"]:
+                # Capture export also needs batches holding management-only
+                # keys, even when all data was decoded by an earlier batch.
+                if decrypted_pcap is None and before["protected_data"] and count == before["protected_data"]:
                     break
             newly_decoded = store.decoded_count(new_only=True)
             after = dict(before)
@@ -1088,7 +1108,7 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                                  display_filter, decrypted_only, [value for _, value in batches[index]],
                                  remove_beamforming=remove_beamforming, progress=notify)
             if decrypted_pcap is not None:
-                for index in sorted(store.owners()):
+                for index in sorted(profiles):
                     notify({"stage": "capture", "batch": index + 1, "batches": len(batches)})
                     collect_plaintext(tshark, pcap, root, profiles[index], timeout, store, index,
                                       [value for _, value in batches[index]])
@@ -1117,9 +1137,13 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
             if decrypted_pcap is not None:
                 capture = write_capture(pcap, decrypted_pcap, store, digest)
                 capture["path"] = str(decrypted_pcap.resolve())
-                capture["frames_left_protected"] = before["protected_data"] - capture["frames_decrypted"]
-                capture["decoded_not_rewritten"] = newly_decoded - capture["frames_decrypted"]
+                capture["data_frames_left_protected"] = before["protected_data"] - capture["data_frames_decrypted"]
+                capture["management_frames_left_protected"] = before["protected_management"] - capture["management_frames_decrypted"]
+                capture["frames_left_protected"] = capture["data_frames_left_protected"] + capture["management_frames_left_protected"]
+                capture["decoded_not_rewritten"] = newly_decoded - capture["data_frames_decrypted"]
                 report["decrypted_capture"] = capture
+                report["verified"] = report["verified"] or bool(capture["management_frames_decrypted"])
+                report["verification_scope"] += "; capture export also checks TShark's decrypted unicast management bodies"
             if report_path is not None:
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -1236,8 +1260,9 @@ def main(argv=None):
               f"Still undecoded: {report['protected_data_remaining']}.", file=sys.stderr)
         if "decrypted_capture" in report:
             capture = report["decrypted_capture"]
-            print(f"Capture: {capture['frames_decrypted']} data frames rewritten; "
-                  f"{capture['frames_left_protected']} protected data frames left. "
+            print(f"Capture: {capture['data_frames_decrypted']} data and "
+                  f"{capture['management_frames_decrypted']} management frames rewritten; "
+                  f"{capture['frames_left_protected']} protected frames left. "
                   f"All {capture['frames_written']} packets retained.", file=sys.stderr)
         return 0 if report["verified"] else 2
     except KeyboardInterrupt:
