@@ -4,7 +4,8 @@ NAME:       lf_wifi_decrypt.py
 
 PURPOSE:    Decode a Wi-Fi capture using keys from LANforge Wi-Fi events or
             supplicant logs. Keep keys from multiple stations, reconnects
-            and group rekeys, and write brief or verbose TShark text.
+            and group rekeys. Write TShark text and optionally a capture
+            retaining Wi-Fi headers and all original packets.
 
 EXAMPLE:    # Decode one capture using events from multiple resources
             ./lf_wifi_decrypt.py --pcap capture.pcapng \
@@ -36,9 +37,11 @@ import re
 import shlex
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 from collections import Counter
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
@@ -49,6 +52,35 @@ MAX_KEYS_PER_PASS = 64
 WORKSPACE_PREFIX = "lf_wifi_decrypt_"
 WORKSPACE_MARKER = ".workspace.json"
 WORKSPACE_LOCK = ".workspace.lock"
+CAPTURE_LUA = r'''
+-- Export TShark's decrypted data source; never implement cryptography here.
+local wlan = Field.new("wlan")
+local llc = Field.new("llc")
+local ccmp = Field.new("wlan.ccmp.extiv")
+local flags = Field.new("radiotap.flags")
+local fcs = Field.new("wlan.fcs")
+local listener = Listener.new("frame", "wlan.fc.type == 2 && wlan.fc.protected == 1 && llc", true)
+io.write("LF_WIFI_PLAINTEXT_V1\n")
+local function export_packet(pinfo, tvb)
+    local w, l, c, f, checksum = wlan(), llc(), ccmp(), flags(), fcs()
+    if w and l and c and c.len == 8 and l.source and l.source ~= tvb
+            and w.source == tvb and c.source == tvb then
+        if checksum and checksum.len ~= 4 then return end
+        io.write(string.format("%d\t%d\t%d\t%d\t%d\t%d\t%s\n",
+            pinfo.number, w.offset, c.offset, f and f.offset or -1,
+            checksum and checksum.offset or -1, tvb:len(),
+            l.source:bytes():tohex(false, "")))
+    end
+end
+function listener.packet(pinfo, tvb)
+    local ok, err = pcall(export_packet, pinfo, tvb)
+    if not ok then io.write("ERROR\t", tostring(err):gsub("[\r\n]", " "), "\n") end
+end
+function listener.draw()
+    io.write("END\n")
+    io.flush()
+end
+'''
 COLUMNS = ('"No.","%m","Time","%t","Source","%s",'
            '"Destination","%d","Protocol","%p","Length","%L","Freq","%F",'
            '"RSSI","%Cus:wlan_radio.signal_dbm","Info","%i",'
@@ -266,7 +298,7 @@ def workspace_files(root):
     """
     files, profiles = [], []
     names = {"frames.sqlite", "frames.sqlite-journal", "frames.sqlite-wal", "frames.sqlite-shm",
-             WORKSPACE_MARKER, WORKSPACE_LOCK}
+             WORKSPACE_MARKER, WORKSPACE_LOCK, "packet_export.lua"}
     for item in root.iterdir():
         if item.name in names and owned_plain_path(item):
             files.append(item)
@@ -408,6 +440,7 @@ class MemoryFrameStore:
         self.decoded = {}
         self.eapol = set()
         self.output = {}
+        self.capture = {}
 
     def transaction(self):
         return nullcontext()
@@ -440,6 +473,15 @@ class MemoryFrameStore:
     def text_count(self):
         return len(self.output)
 
+    def add_capture(self, number, metadata, batch):
+        row = self.decoded.get(number)
+        if row is not None and not row[0] and row[1] == batch:
+            self.capture.setdefault(number, metadata)
+
+    def iter_capture(self):
+        for number in sorted(self.capture):
+            yield number, self.capture[number]
+
     def iter_text(self):
         for number in sorted(self.output):
             yield self.output[number]
@@ -448,6 +490,7 @@ class MemoryFrameStore:
         self.decoded.clear()
         self.eapol.clear()
         self.output.clear()
+        self.capture.clear()
 
 
 class SqliteFrameStore:
@@ -466,6 +509,8 @@ class SqliteFrameStore:
                 "CREATE TABLE decoded(frame INTEGER PRIMARY KEY, baseline INTEGER, owner INTEGER, protocols TEXT);"
                 "CREATE TABLE eapol(frame INTEGER PRIMARY KEY);"
                 "CREATE TABLE output(frame INTEGER PRIMARY KEY, body TEXT);"
+                "CREATE TABLE capture(frame INTEGER PRIMARY KEY, wlan_offset INTEGER, crypto_offset INTEGER, "
+                "flags_offset INTEGER, fcs_offset INTEGER, packet_length INTEGER, body BLOB);"
             )
         except BaseException:
             self.database.close()
@@ -507,6 +552,17 @@ class SqliteFrameStore:
 
     def text_count(self):
         return self.database.execute("SELECT COUNT(*) FROM output").fetchone()[0]
+
+    def add_capture(self, number, metadata, batch):
+        self.database.execute(
+            "INSERT OR IGNORE INTO capture SELECT ?, ?, ?, ?, ?, ?, ? "
+            "WHERE EXISTS(SELECT 1 FROM decoded WHERE frame = ? AND owner = ? AND baseline = 0)",
+            (number, *metadata, number, batch),
+        )
+
+    def iter_capture(self):
+        for row in self.database.execute("SELECT * FROM capture ORDER BY frame"):
+            yield row[0], row[1:]
 
     def iter_text(self):
         for row in self.database.execute("SELECT body FROM output ORDER BY frame"):
@@ -648,6 +704,258 @@ def render_batch(tshark, pcap, env, timeout, store, batch, mode,
                 store.add_output(number, body, batch)
 
 
+def collect_plaintext(tshark, pcap, root, env, timeout, store, batch, secrets):
+    """Keep complete decrypted payloads only from each frame's successful batch.
+
+    Lua reads the decrypted Tvb that TShark used for LLC dissection. The
+    output stays in the selected packet buffer: RAM for memory mode, a
+    temporary file for SQLite. A completion marker detects script failures.
+    """
+    script = root / "packet_export.lua"
+    if not script.exists():
+        script.write_text(CAPTURE_LUA, encoding="utf-8")
+    command = base_command(tshark, pcap, True) + ["-q", "-X", "lua_script:" + str(script)]
+    with packet_buffer(store) as output:
+        run_checked(command, env, timeout, secrets, output)
+        output.seek(0)
+        if output.readline().rstrip("\r\n") != "LF_WIFI_PLAINTEXT_V1":
+            raise RuntimeError("Capture export did not start; TShark must support Lua.")
+        complete = False
+        with store.transaction():
+            for line in output:
+                row = line.rstrip("\r\n").split("\t")
+                if row == ["END"]:
+                    complete = True
+                    continue
+                if complete or len(row) != 7:
+                    raise RuntimeError("TShark's plaintext export was incomplete or invalid.")
+                number, wlan_offset, crypto_offset, flags_offset, fcs_offset, length = map(int, row[:6])
+                payload = bytes.fromhex(row[6])
+                store.add_capture(number, (wlan_offset, crypto_offset, flags_offset, fcs_offset, length, payload), batch)
+        if not complete:
+            raise RuntimeError("TShark did not finish its plaintext export.")
+
+
+def rebuild_wlan_frame(packet, linktype, metadata):
+    """Replace CCMP-family ciphertext while retaining the original MAC/radio header.
+
+    Leave fragments and layouts we cannot validate unchanged. Recompute FCS
+    when present; radiotap's driver-only data padding is excluded from CRC.
+    """
+    wlan_offset, crypto_offset, flags_offset, fcs_offset, length, payload = metadata
+    if len(packet) != length:
+        raise RuntimeError("Packet length changed after plaintext extraction.")
+    if linktype == 127:
+        if len(packet) < 8 or packet[0] != 0 or struct.unpack_from("<H", packet, 2)[0] != wlan_offset:
+            raise RuntimeError("Radiotap header does not match the exported packet.")
+    elif linktype != 105 or wlan_offset != 0:
+        return None, "unsupported link type"
+    if not (0 <= wlan_offset <= crypto_offset <= len(packet)) or crypto_offset < wlan_offset + 24:
+        raise RuntimeError("Invalid 802.11 header boundaries in plaintext export.")
+    fc0, fc1 = packet[wlan_offset:wlan_offset + 2]
+    if (fc0 & 15) != 8 or not (fc1 & 64):
+        raise RuntimeError("Plaintext export does not identify a protected data frame.")
+    if fc1 & 4 or packet[wlan_offset + 22] & 15:
+        return None, "fragmented data"
+    if flags_offset != -1 and not 0 <= flags_offset < wlan_offset:
+        raise RuntimeError("Invalid radiotap flags offset in plaintext export.")
+    flags = packet[flags_offset] if flags_offset >= 0 else 0
+    has_fcs = fcs_offset >= 0
+    if (has_fcs and fcs_offset != len(packet) - 4) or (flags_offset >= 0 and bool(flags & 16) != has_fcs):
+        return None, "ambiguous FCS layout"
+    overhead = len(packet) - crypto_offset - len(payload) - (4 if has_fcs else 0)
+    if overhead not in (16, 24):
+        return None, "unsupported plaintext layout"
+    header = bytearray(packet[:crypto_offset])
+    header[wlan_offset + 1] &= ~64  # Payload is now plaintext, so clear Protected.
+    if flags_offset >= 0:
+        header[flags_offset] &= ~4  # Clear radiotap's protected/WEP indicator too.
+        if has_fcs:
+            header[flags_offset] &= ~64  # The replacement FCS is valid.
+    crc_header = bytes(header[wlan_offset:])
+    if flags & 32:
+        qos = bool(fc0 & 128)
+        mac_length = 24 + (6 if fc1 & 3 == 3 else 0) + (2 if qos else 0) + (4 if qos and fc1 & 128 else 0)
+        if crypto_offset - wlan_offset != ((mac_length + 3) & ~3):
+            return None, "unsupported padded MAC header"
+        crc_header = bytes(header[wlan_offset:wlan_offset + mac_length])
+    result = bytes(header) + payload
+    if has_fcs:
+        result += struct.pack("<I", zlib.crc32(crc_header + payload) & 0xffffffff)
+    return result, None
+
+
+def read_capture_bytes(stream, length):
+    """Read a bounded capture record and reject truncation before writing output."""
+    if not 0 <= length <= 64 * 1024 * 1024:
+        raise ValueError("Capture record is too large or invalid.")
+    data = stream.read(length)
+    if len(data) != length:
+        raise ValueError("Truncated capture record.")
+    return data
+
+
+def packet_options(data, endian):
+    """Keep packet options except hashes that would describe the old ciphertext."""
+    result, offset = bytearray(), 0
+    while offset < len(data):
+        if offset + 4 > len(data):
+            raise ValueError("Truncated pcapng packet option.")
+        code, length = struct.unpack_from(endian + "HH", data, offset)
+        size = 4 + ((length + 3) & ~3)
+        if offset + size > len(data):
+            raise ValueError("Invalid pcapng packet option length.")
+        if code == 0:
+            if length:
+                raise ValueError("Invalid pcapng end-of-options marker.")
+            result.extend(data[offset:])
+            break
+        if code != 3:
+            result.extend(data[offset:offset + size])
+        offset += size
+    return bytes(result)
+
+
+def rewrite_pcap(source, target, rewrite):
+    """Copy standard pcap records with timestamps and file header intact."""
+    header = read_capture_bytes(source, 24)
+    formats = {b"\xd4\xc3\xb2\xa1": "<", b"\xa1\xb2\xc3\xd4": ">",
+               b"\x4d\x3c\xb2\xa1": "<", b"\xa1\xb2\x3c\x4d": ">"}
+    endian = formats.get(header[:4])
+    if endian is None or struct.unpack_from(endian + "HH", header, 4) != (2, 4):
+        raise ValueError("Capture output requires standard pcap 2.4 or pcapng input.")
+    linktype = struct.unpack_from(endian + "I", header, 20)[0] & 0xffff
+    target.write(header)
+    while True:
+        record = source.read(16)
+        if not record:
+            break
+        if len(record) != 16:
+            raise ValueError("Truncated pcap packet header.")
+        caplen, wirelen = struct.unpack_from(endian + "II", record, 8)
+        packet = read_capture_bytes(source, caplen)
+        replacement, size = rewrite(packet, wirelen, linktype)
+        target.write(record if replacement is packet else record[:8] + struct.pack(endian + "II", len(replacement), size))
+        target.write(replacement)
+
+
+def rewrite_pcapng(source, target, rewrite):
+    """Preserve sections, interfaces and other blocks while replacing packet data."""
+    endian, interfaces = None, []
+    while True:
+        header = source.read(8)
+        if not header:
+            break
+        if len(header) != 8:
+            raise ValueError("Truncated pcapng block header.")
+        section = header[:4] == b"\x0a\x0d\x0d\x0a"
+        prefix = b""
+        if section:
+            prefix = read_capture_bytes(source, 4)
+            if prefix not in (b"\x4d\x3c\x2b\x1a", b"\x1a\x2b\x3c\x4d"):
+                raise ValueError("Invalid pcapng byte-order marker.")
+            endian = "<" if prefix == b"\x4d\x3c\x2b\x1a" else ">"
+            interfaces = []
+        if endian is None:
+            raise ValueError("pcapng input has no section header.")
+        kind, length = struct.unpack(endian + "II", header)
+        if length < 12 + len(prefix) or length % 4:
+            raise ValueError("Invalid pcapng block length.")
+        if section and length < 28:
+            raise ValueError("Invalid pcapng section header.")
+        block = header + prefix + read_capture_bytes(source, length - 8 - len(prefix))
+        if struct.unpack_from(endian + "I", block, length - 4)[0] != length:
+            raise ValueError("pcapng block lengths disagree.")
+        if kind == 1:
+            if length < 20:
+                raise ValueError("Invalid pcapng interface block.")
+            interfaces.append((struct.unpack_from(endian + "H", block, 8)[0], struct.unpack_from(endian + "I", block, 12)[0]))
+        elif kind in (2, 3, 6):
+            if length < (16 if kind == 3 else 32):
+                raise ValueError("Invalid pcapng packet block.")
+            interface = 0 if kind == 3 else struct.unpack_from(endian + ("H" if kind == 2 else "I"), block, 8)[0]
+            if interface >= len(interfaces):
+                raise ValueError("pcapng packet references a missing interface.")
+            linktype, snaplen = interfaces[interface]
+            start = 12 if kind == 3 else 28
+            if kind == 3:
+                wirelen = struct.unpack_from(endian + "I", block, 8)[0]
+                caplen = min(wirelen, snaplen or wirelen)
+            else:
+                caplen, wirelen = struct.unpack_from(endian + "II", block, 20)
+            end = start + ((caplen + 3) & ~3)
+            if end > length - 4:
+                raise ValueError("pcapng packet exceeds its block.")
+            if kind == 3 and end != length - 4:
+                raise ValueError("Invalid pcapng simple packet length.")
+            packet = block[start:start + caplen]
+            replacement, size = rewrite(packet, wirelen, linktype)
+            if replacement is not packet:
+                prefix = bytearray(block[8:start])
+                struct.pack_into(endian + "I", prefix, 0 if kind == 3 else 12, size if kind == 3 else len(replacement))
+                if kind != 3:
+                    struct.pack_into(endian + "I", prefix, 16, size)
+                options = b"" if kind == 3 else packet_options(block[end:-4], endian)
+                body = bytes(prefix) + replacement + b"\0" * (-len(replacement) % 4) + options
+                length = len(body) + 12
+                block = struct.pack(endian + "II", kind, length) + body + struct.pack(endian + "I", length)
+        target.write(block)
+
+
+def write_capture(pcap, path, store, digest):
+    """Atomically write a capture containing every original packet, in order.
+
+    Unknown keys, fragments and unsupported payload layouts stay encrypted.
+    Untouched packet records and metadata blocks are copied byte for byte.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payloads = iter(store.iter_capture())
+    pending = next(payloads, None)
+    stats = {"frames_written": 0, "frames_decrypted": 0, "skipped": Counter()}
+
+    def rewrite(packet, wirelen, linktype):
+        nonlocal pending
+        stats["frames_written"] += 1
+        number = stats["frames_written"]
+        if pending is None or pending[0] > number:
+            return packet, wirelen
+        if pending[0] < number:
+            raise RuntimeError("Plaintext frame order does not match the capture.")
+        metadata = pending[1]
+        pending = next(payloads, None)
+        if wirelen != len(packet):
+            replacement, reason = None, "truncated packet"
+        else:
+            replacement, reason = rebuild_wlan_frame(packet, linktype, metadata)
+        if replacement is None:
+            stats["skipped"][reason] += 1
+            return packet, wirelen
+        stats["frames_decrypted"] += 1
+        return replacement, wirelen + len(replacement) - len(packet)
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".lf_wifi_decrypt_", dir=path.parent, delete=False) as target:
+            temporary = Path(target.name)
+            with pcap.open("rb") as source:
+                magic = source.read(4)
+                source.seek(0)
+                if magic == b"\x0a\x0d\x0d\x0a":
+                    rewrite_pcapng(source, target, rewrite)
+                    stats["format"] = "pcapng"
+                else:
+                    rewrite_pcap(source, target, rewrite)
+                    stats["format"] = "pcap"
+        if pending is not None or file_sha256(pcap) != digest:
+            raise RuntimeError("Capture changed or plaintext records do not match its frame count.")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    stats["skipped"] = dict(stats["skipped"])
+    return stats
+
+
 def write_text(store, path, stream):
     """Write stored records in capture order to a stream or replace a text file.
 
@@ -679,7 +987,8 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                     decrypted_only=False, output=None, report_path=None,
                     tshark="tshark", timeout=120, key_batch_size=64,
                     interfaces=(), resources=(), progress=None, output_stream=None,
-                    storage="sqlite", remove_beamforming=False, user_db_prefix=None):
+                    storage="sqlite", remove_beamforming=False, user_db_prefix=None,
+                    decrypted_pcap=None):
     """Decode a capture and return a JSON-compatible verification report.
 
     Supply an output path for decoded text, or output_stream for a text stream.
@@ -699,6 +1008,11 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
     remove_beamforming excludes HE/EHT/VHT compressed beamforming/CQI reports
     from text only. Verification still scans the whole capture. Text timestamps
     use epoch seconds; progress callbacks also receive redacted render commands.
+
+    decrypted_pcap writes all original records and metadata, replacing supported
+    decoded CCMP data payloads. It needs TShark Lua and uncompressed pcap/pcapng
+    input. Unsupported/unknown frames stay unchanged; inspect the returned
+    decrypted_capture counts to distinguish text decoding from capture export.
     """
     pcap = Path(pcap)
     if isinstance(events, (str, Path)):
@@ -706,10 +1020,11 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
     events = [Path(path) for path in events]
     output = Path(output) if output is not None else None
     report_path = Path(report_path) if report_path is not None else None
+    decrypted_pcap = Path(decrypted_pcap) if decrypted_pcap is not None else None
     inputs = {path.resolve() for path in [pcap] + events}
-    destinations = [path.resolve() for path in [output, report_path] if path is not None]
+    destinations = [path.resolve() for path in [output, report_path, decrypted_pcap] if path is not None]
     if any(path in inputs for path in destinations) or len(destinations) != len(set(destinations)):
-        raise ValueError("Output and report paths must differ from each other and from the inputs.")
+        raise ValueError("Output paths must differ from one another and from the inputs.")
     if not pcap.is_file():
         raise ValueError("Capture file does not exist.")
     if mode not in ("brief", "verbose"):
@@ -772,6 +1087,11 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                     render_batch(tshark, pcap, profiles[index], timeout, store, index, mode,
                                  display_filter, decrypted_only, [value for _, value in batches[index]],
                                  remove_beamforming=remove_beamforming, progress=notify)
+            if decrypted_pcap is not None:
+                for index in sorted(store.owners()):
+                    notify({"stage": "capture", "batch": index + 1, "batches": len(batches)})
+                    collect_plaintext(tshark, pcap, root, profiles[index], timeout, store, index,
+                                      [value for _, value in batches[index]])
             if file_sha256(pcap) != digest:
                 raise RuntimeError("Capture changed during decoding; use a completed capture.")
             report = {
@@ -794,6 +1114,12 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                 "text_reassembly_scope": "Per key batch; cross-batch stream reassembly is not combined",
             }
             write_text(store, output, output_stream)
+            if decrypted_pcap is not None:
+                capture = write_capture(pcap, decrypted_pcap, store, digest)
+                capture["path"] = str(decrypted_pcap.resolve())
+                capture["frames_left_protected"] = before["protected_data"] - capture["frames_decrypted"]
+                capture["decoded_not_rewritten"] = newly_decoded - capture["frames_decrypted"]
+                report["decrypted_capture"] = capture
             if report_path is not None:
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -842,7 +1168,9 @@ def parse_args(argv=None):
                         help="Exclude HE/EHT/VHT compressed beamforming/CQI reports from text; combines with --filter")
     parser.add_argument("--decrypted-only", action="store_true")
     parser.add_argument("-o", "--output", type=Path, help="Decoded text; default is standard output")
-    parser.add_argument("--report", type=Path, help="JSON report; defaults to OUTPUT.json")
+    parser.add_argument("--report", type=Path, help="JSON report; defaults to the text/capture output name plus .json")
+    parser.add_argument("--decrypted-pcap", type=Path,
+                        help="Write every original packet, replacing supported decoded data payloads; requires TShark Lua and uncompressed pcap/pcapng input")
     parser.add_argument("--tshark", default="tshark")
     parser.add_argument("--timeout", type=float, default=120, help="Timeout per TShark invocation")
     parser.add_argument("--key-batch-size", type=int, default=64, help="Keys per pass, from 1 to 64")
@@ -855,12 +1183,14 @@ def parse_args(argv=None):
     parser.add_argument("--quiet", action="store_true", help="Hide batch progress and TShark render commands")
     args = parser.parse_args(argv)
     if args.purge_sqlite:
-        if any([args.pcap, args.events, args.tk, args.ssid, args.password, args.output, args.report]):
+        if any([args.pcap, args.events, args.tk, args.ssid, args.password, args.output, args.report, args.decrypted_pcap]):
             parser.error("Use --purge_sqlite by itself, without capture/key/output arguments.")
     elif args.pcap is None:
         parser.error("--pcap is required for decoding.")
     if args.output is not None and args.report is None:
         args.report = Path(str(args.output) + ".json")
+    elif args.decrypted_pcap is not None and args.report is None:
+        args.report = Path(str(args.decrypted_pcap) + ".json")
     return args
 
 
@@ -876,6 +1206,8 @@ def main(argv=None):
             print(f"Checking key batch {event['batch']}/{event['batches']}", file=sys.stderr)
         elif event["stage"] == "command":
             print("tshark command: " + event["command"], file=sys.stderr)
+        elif event["stage"] == "capture":
+            print(f"Exporting capture payloads from key batch {event['batch']}/{event['batches']}", file=sys.stderr)
 
     try:
         if args.purge_sqlite:
@@ -894,6 +1226,7 @@ def main(argv=None):
             storage=args.storage,
             remove_beamforming=args.remove_beamforming,
             user_db_prefix=args.user_db_prefix,
+            decrypted_pcap=args.decrypted_pcap,
         )
         for warning in report["warnings"][:20]:
             print("Warning: " + warning, file=sys.stderr)
@@ -901,6 +1234,11 @@ def main(argv=None):
             print(f"{len(report['warnings']) - 20} more warnings are in the report.", file=sys.stderr)
         print(f"Newly decoded protected data frames: {report['newly_decoded_protected_frames']}. "
               f"Still undecoded: {report['protected_data_remaining']}.", file=sys.stderr)
+        if "decrypted_capture" in report:
+            capture = report["decrypted_capture"]
+            print(f"Capture: {capture['frames_decrypted']} data frames rewritten; "
+                  f"{capture['frames_left_protected']} protected data frames left. "
+                  f"All {capture['frames_written']} packets retained.", file=sys.stderr)
         return 0 if report["verified"] else 2
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
