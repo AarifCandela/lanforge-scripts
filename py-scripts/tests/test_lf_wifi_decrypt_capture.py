@@ -197,6 +197,70 @@ class CaptureTest(unittest.TestCase):
                 with patch.object(wd, "run_checked", side_effect=fake_run), self.assertRaises(RuntimeError):
                     wd.collect_plaintext("tshark", Path("input"), Path(area), {}, 10, store, 0, [])
 
+    def test_unicast_management_body_and_fcs_are_rewritten(self):
+        # Deauthentication and action frames use a management body, not LLC.
+        for subtype, body in [(0xC0, b"\x03\0"), (0xD0, b"\x08\0\x01\x02")]:
+            for storage in ["memory", "sqlite"]:
+                with self.subTest(subtype=subtype, storage=storage), tempfile.TemporaryDirectory() as area:
+                    radio = struct.pack("<BBHI", 0, 0, 9, 2) + b"\x54"
+                    mac = bytes([subtype, 0x40]) + b"\0" * 22
+                    packet = radio + mac + b"I" * 8 + b"C" * len(body) + b"M" * 8 + b"FCS!"
+                    metadata = (9, 33, 8, len(packet) - 4, len(packet), body)
+                    store = wd.MemoryFrameStore() if storage == "memory" else wd.SqliteFrameStore(Path(area) / "frames.sqlite")
+                    with closing(store), store.transaction():
+                        store.add_capture(1, metadata, 1)
+                        store.add_capture(1, (*metadata[:-1], b"wrong batch"), 2)
+                        self.assertEqual(list(store.iter_capture()), [(1, metadata)])
+                    plain, reason = wd.rebuild_wlan_frame(packet, 127, metadata)
+                    self.assertIsNone(reason)
+                    expected_mac = bytes([subtype, 0]) + mac[2:]
+                    expected = radio[:8] + b"\x10" + expected_mac + body
+                    expected += struct.pack("<I", zlib.crc32(expected_mac + body) & 0xffffffff)
+                    self.assertEqual(plain, expected)
+                    # Group BIP is authenticated plaintext; never rewrite it as
+                    # a CCMP management frame, even if handed bogus metadata.
+                    group = packet[:13] + b"\x01" + packet[14:]
+                    self.assertEqual(wd.rebuild_wlan_frame(group, 127, metadata),
+                                     (None, "unsupported management header"))
+
+    def test_management_only_key_batch_after_all_data_is_decoded(self):
+        for storage in ["sqlite", "memory"]:
+            for management_only in [False, True]:
+                with self.subTest(storage=storage, management_only=management_only), tempfile.TemporaryDirectory() as area:
+                    data = MAC + CIPHERTEXT
+                    mgmt = b"\xc0\x40" + b"\0" * 22 + b"I" * 8 + b"CC" + b"M" * 8
+                    source, destination = Path(area) / "in.pcap", Path(area) / "out.pcap"
+                    source.write_bytes(pcap([mgmt] if management_only else [data, mgmt]))
+                    management_number = 1 if management_only else 2
+
+                    def fake_run(command, env, timeout, secrets, output,
+                                 _only=management_only, _data=data, _mgmt=mgmt, _number=management_number):
+                        profile = Path(env["WIRESHARK_CONFIG_DIR"]).name
+                        if "-X" in command:
+                            output.write("LF_WIFI_PLAINTEXT_V1\n")
+                            if profile == "batch_0" and not _only:
+                                output.write(f"1\t0\t24\t-1\t-1\t{len(_data)}\t{PLAIN.hex()}\n")
+                            if profile == "batch_1":
+                                output.write(f"{_number}\t0\t24\t-1\t-1\t{len(_mgmt)}\t0300\n")
+                            output.write("END\n")
+                        else:
+                            if not _only:
+                                chain = "wlan:llc:ip" if profile == "batch_0" else "wlan:data"
+                                output.write(f"1\t{chain}\t1\t2\t02:00:00:00:00:01\n")
+                            output.write(f"{_number}\twlan\t1\t0\t02:00:00:00:00:01\n")
+                    with patch.object(wd, "run_checked", side_effect=fake_run):
+                        report = wd.decrypt_capture(source, temporal_keys=["ab" * 16, "cd" * 16], storage=storage,
+                                                    key_batch_size=1, decrypted_pcap=destination)
+                    self.assertTrue(report["verified"])
+                    self.assertEqual(report["batches_tried"], 2)
+                    capture = report["decrypted_capture"]
+                    self.assertEqual(capture["management_frames_decrypted"], 1)
+                    self.assertEqual(capture["data_frames_decrypted"], 0 if management_only else 1)
+                    self.assertEqual(capture["frames_left_protected"], 0)
+                    expected_mgmt = b"\xc0\0" + mgmt[2:24] + b"\x03\0"
+                    expected_data = b"\x08\x01" + MAC[2:] + PLAIN
+                    self.assertEqual(destination.read_bytes(), pcap([expected_mgmt] if management_only else [expected_data, expected_mgmt]))
+
     def test_capture_api_and_memory_mode_without_sqlite_or_packet_spool(self):
         for storage in ["sqlite", "memory"]:
             with self.subTest(storage=storage), tempfile.TemporaryDirectory() as area:

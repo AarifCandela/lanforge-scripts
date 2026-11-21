@@ -147,7 +147,7 @@ data with LLC; protected management-frame verification is outside its scope.
 
 Add `--decrypted-pcap OUTPUT` to save a second capture that keeps every original
 packet in order, with original timestamps, interface information and radio/MAC
-headers. Supported decoded data frames get plaintext payloads and a cleared
+headers. Supported decoded data and unicast PMF management frames get plaintext payloads and a cleared
 Protected flag. FCS is recalculated when present. Other packet records are
 copied unchanged. Capture output always retains every input packet, independent
 of the text filters.
@@ -162,11 +162,19 @@ precision and pcapng sections/interfaces. SQLite mode spools the extra export
 pass to disk; memory mode keeps it in RAM. Temporary key profiles and the Lua
 helper are removed with the workspace.
 
-The writer currently handles complete CCMP data sources. Unknown keys,
-fragmented data and layouts it cannot validate stay encrypted. Protected
-management frames also stay as captured. The report's `decrypted_capture`
-section gives total packets, rewritten data frames and data frames still
-protected. `decoded_not_rewritten` identifies text-decodable frames that were
+The writer handles complete decrypted CCMP-family data and unicast management
+bodies exposed by TShark. Matching station/session TKs can decrypt unicast PMF
+without captured EAPOL, just as they can decrypt unicast data. Group management
+uses BIP integrity protection rather than payload encryption; IGTK/BIGTK MIC
+verification is not implemented here, and those packets stay unchanged.
+
+Frames with unknown keys, fragments and layouts the writer cannot validate
+stay unchanged. This includes captures where a driver removed crypto headers
+but left the Protected flag set; the script does not guess missing headers.
+The report's `decrypted_capture` section gives total packets, rewritten data
+and management counts, and separate counts still protected. All key batches
+are tried when saving a capture, including batches needed only by management
+frames. `decoded_not_rewritten` identifies text-decodable data frames that were
 not safe to rewrite. Hash options describing the original ciphertext are
 removed from rewritten packet records; packet comments and other options stay.
 
