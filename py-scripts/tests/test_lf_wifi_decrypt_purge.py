@@ -20,8 +20,8 @@ spec.loader.exec_module(wd)
 
 
 class PurgeTest(unittest.TestCase):
-    def cache(self, parent, name="stale", marked=True):
-        root = parent / (wd.WORKSPACE_PREFIX + name)
+    def cache(self, parent, name="stale", marked=True, user_db_prefix=None):
+        root = parent / (wd.workspace_prefix(user_db_prefix) + name)
         root.mkdir()
         with closing(sqlite3.connect(root / "frames.sqlite")) as db:
             db.execute("CREATE TABLE synthetic(frame INTEGER)")
@@ -29,7 +29,7 @@ class PurgeTest(unittest.TestCase):
         wd.make_profile(root, "baseline", [])
         wd.make_profile(root, "batch_0", [("tk", "ab" * 16)])
         if marked:
-            (root / wd.WORKSPACE_MARKER).write_text(json.dumps(wd.workspace_identity("sqlite")))
+            (root / wd.WORKSPACE_MARKER).write_text(json.dumps(wd.workspace_identity("sqlite", user_db_prefix)))
             (root / wd.WORKSPACE_LOCK).write_bytes(b"0")
         return root
 
@@ -129,6 +129,60 @@ class PurgeTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as raised:
                     wd.parse_args(argv)
                 self.assertEqual(raised.exception.code, 2)
+
+    def test_named_purge_leaves_other_groups_and_their_active_runs_alone(self):
+        with tempfile.TemporaryDirectory() as area:
+            parent = Path(area)
+            selected = self.cache(parent, user_db_prefix="suite")
+            overlapping = self.cache(parent, user_db_prefix="suite_extra")
+            unnamed = self.cache(parent)
+            with patch.object(wd.tempfile, "tempdir", area), wd.temporary_workspace("sqlite", "other-suite"):
+                result = wd.purge_sqlite_workspaces(parent, user_db_prefix="suite")
+                self.assertEqual(result["removed"], [selected.name])
+                self.assertTrue(overlapping.exists())
+                self.assertTrue(unnamed.exists())
+                self.assertEqual(wd.purge_sqlite_workspaces(parent)["removed"], [unnamed.name])
+                self.assertTrue(overlapping.exists())
+
+    def test_same_named_group_remains_unique_and_blocks_purge_while_active(self):
+        with tempfile.TemporaryDirectory() as area:
+            parent = Path(area)
+            stale = self.cache(parent, user_db_prefix="job-1")
+            with patch.object(wd.tempfile, "tempdir", area), \
+                    wd.temporary_workspace("sqlite", "job-1") as first, \
+                    wd.temporary_workspace("sqlite", "job-1") as second:
+                self.assertNotEqual(first, second)
+                self.assertTrue(first.name.startswith(wd.workspace_prefix("job-1")))
+                self.assertTrue(second.name.startswith(wd.workspace_prefix("job-1")))
+                with self.assertRaisesRegex(RuntimeError, "busy"):
+                    wd.purge_sqlite_workspaces(parent, user_db_prefix="job-1")
+                self.assertTrue(stale.exists())
+            self.assertEqual(wd.purge_sqlite_workspaces(parent, user_db_prefix="job-1")["removed"], [stale.name])
+
+    def test_named_cli_purge_is_scoped(self):
+        with tempfile.TemporaryDirectory() as area:
+            parent = Path(area)
+            selected = self.cache(parent, user_db_prefix="suite")
+            unnamed = self.cache(parent)
+            env = dict(os.environ, TMPDIR=area, TMP=area, TEMP=area)
+            result = subprocess.run([sys.executable, str(MODULE), "--purge_sqlite", "--user-db-prefix", "suite"],
+                                    env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(selected.exists())
+            self.assertTrue(unnamed.exists())
+
+    def test_invalid_group_labels_fail_before_creating_workspaces(self):
+        for label in ["", "../other", "/tmp/job", "C:\\temp", "*", "job?", ".job", "a" * 65]:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as area:
+                parent = Path(area)
+                with self.assertRaises(ValueError):
+                    wd.purge_sqlite_workspaces(parent, user_db_prefix=label)
+                with self.assertRaises(ValueError), wd.temporary_workspace("sqlite", label):
+                    pass
+                with patch.object(wd.sys, "stderr"), self.assertRaises(SystemExit) as raised:
+                    wd.parse_args(["--purge_sqlite", "--user-db-prefix", label])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertEqual(list(parent.iterdir()), [])
 
     def test_concurrent_processes_and_killed_run_recovery(self):
         # Real independent Python processes share one controlled temp root.

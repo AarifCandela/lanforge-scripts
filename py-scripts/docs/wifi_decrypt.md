@@ -65,6 +65,24 @@ before purging. Old unmarked caches are recognized by their SQLite header and
 layout on Unix, with UID ownership checks. Unmarked Windows caches are skipped;
 review those manually. RAM-mode workspaces are outside this SQLite purge.
 
+Use `--user-db-prefix NAME` to keep one automation job's caches separate from
+another job running under the same account. The label scopes cleanup, while a
+random suffix still gives every concurrent call its own directory and DB:
+
+```sh
+python3 lf_wifi_decrypt.py --pcap capture.pcapng --events wifi_events.txt --user-db-prefix overnight -o decoded.txt
+python3 lf_wifi_decrypt.py --purge_sqlite --user-db-prefix overnight
+```
+
+The second command only considers caches whose marker has the exact
+`overnight` label. An active job with a different label does not block this
+cleanup; an active SQLite job with the same label does. With no label, purge
+only considers the default, unnamed group. Labels use 1-64 letters, digits,
+underscores or hyphens and start with a letter or digit; they are not paths.
+Python callers use `user_db_prefix="overnight"` with `decrypt_capture` or
+`purge_sqlite_workspaces`. This option works with both storage backends; the
+SQLite purge continues to skip RAM workspaces.
+
 ## Reconnects in one capture
 
 The same station can reconnect many times, and many stations can share one
