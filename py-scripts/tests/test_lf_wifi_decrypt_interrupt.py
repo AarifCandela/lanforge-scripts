@@ -21,6 +21,8 @@ import time
 
 profile = Path(os.environ["WIRESHARK_CONFIG_DIR"])
 stage = ("baseline" if profile.name == "baseline" else "keys") if "-T" in sys.argv else "text"
+if "-X" in sys.argv:
+    stage = "capture"
 if stage == os.environ["HOLD_STAGE"]:
     Path(os.environ["READY_FILE"]).write_text(json.dumps({"pid": os.getpid(), "stage": stage}))
     while True:
@@ -49,12 +51,16 @@ class InterruptCleanupTest(unittest.TestCase):
             fake.chmod(0o700)
             output = root / "decoded.txt"
             output.write_text("previous complete output\n")
+            capture_output = root / "decoded.pcapng"
+            capture_output.write_bytes(b"previous complete capture")
             ready = root / "ready.json"
             env = dict(os.environ, TMPDIR=str(cache), TMP=str(cache), TEMP=str(cache),
                        READY_FILE=str(ready), HOLD_STAGE=stage, PYTHONDONTWRITEBYTECODE="1")
             args = [sys.executable, str(MODULE), "--pcap", str(capture), "--tk", "ab" * 16,
                     "--tshark", str(fake), "--storage", storage, "-o", str(output),
                     "--timeout", "20" if interrupt else "1"]
+            if stage == "capture":
+                args += ["--decrypted-pcap", str(capture_output)]
             process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        text=True, start_new_session=True)
             try:
@@ -85,6 +91,7 @@ class InterruptCleanupTest(unittest.TestCase):
                 self.assertFalse(workspace.exists())
                 self.assertEqual(unrelated.read_text(), "preserve another run's data")
                 self.assertEqual(output.read_text(), "previous complete output\n")
+                self.assertEqual(capture_output.read_bytes(), b"previous complete capture")
                 self.assertFalse(list(root.glob(".lf_wifi_decrypt_*")))
                 with self.assertRaises(ProcessLookupError):
                     os.kill(child, 0)
@@ -97,14 +104,15 @@ class InterruptCleanupTest(unittest.TestCase):
 
     def test_ctrl_c_during_scan_and_render(self):
         for storage in ["sqlite", "memory"]:
-            for stage in ["baseline", "keys", "text"]:
+            for stage in ["baseline", "keys", "text", "capture"]:
                 with self.subTest(storage=storage, stage=stage):
                     self.check_cleanup(storage, stage, interrupt=True)
 
     def test_timeout_stops_child_and_cleans_workspace(self):
         for storage in ["sqlite", "memory"]:
-            with self.subTest(storage=storage):
-                self.check_cleanup(storage, "keys", interrupt=False)
+            for stage in ["keys", "capture"]:
+                with self.subTest(storage=storage, stage=stage):
+                    self.check_cleanup(storage, stage, interrupt=False)
 
 
 if __name__ == "__main__":

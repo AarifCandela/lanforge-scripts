@@ -39,6 +39,7 @@ class PurgeTest(unittest.TestCase):
             root = self.cache(parent)
             for sidecar in ["-journal", "-wal", "-shm"]:
                 (root / ("frames.sqlite" + sidecar)).touch()
+            (root / "packet_export.lua").write_text("-- abandoned capture-export helper\n")
             unrelated = parent / "decoded.txt"
             unrelated.write_text("keep completed output")
             result = wd.purge_sqlite_workspaces(parent)

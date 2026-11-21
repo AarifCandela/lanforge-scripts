@@ -140,9 +140,40 @@ A password alone does not decrypt WPA3-SAE; use session keys. Legacy PTK
 extraction is restricted to a confirmed 48-byte CCMP layout. Other PTK layouts
 are skipped with a warning rather than guessed; direct TK events are preferred.
 IGTK/BIGTK are not treated as data-decryption keys. Authentication/cipher support
-ultimately depends on the installed TShark. This tool verifies protected data
-with LLC; it does not verify protected management frames or produce a rewritten
-decrypted pcap.
+ultimately depends on the installed TShark. Text verification uses protected
+data with LLC; protected management-frame verification is outside its scope.
+
+## Save a decrypted capture
+
+Add `--decrypted-pcap OUTPUT` to save a second capture that keeps every original
+packet in order, with original timestamps, interface information and radio/MAC
+headers. Supported decoded data frames get plaintext payloads and a cleared
+Protected flag. FCS is recalculated when present. Other packet records are
+copied unchanged. Capture output always retains every input packet, independent
+of the text filters.
+
+```sh
+python3 lf_wifi_decrypt.py --pcap capture.pcapng --events wifi_events.txt --decrypted-pcap decoded.pcapng -o decoded.txt
+```
+
+This needs a TShark build with Lua enabled and uncompressed pcap or pcapng
+input. The output keeps the input file format, including pcap timestamp
+precision and pcapng sections/interfaces. SQLite mode spools the extra export
+pass to disk; memory mode keeps it in RAM. Temporary key profiles and the Lua
+helper are removed with the workspace.
+
+The writer currently handles complete CCMP data sources. Unknown keys,
+fragmented data and layouts it cannot validate stay encrypted. Protected
+management frames also stay as captured. The report's `decrypted_capture`
+section gives total packets, rewritten data frames and data frames still
+protected. `decoded_not_rewritten` identifies text-decodable frames that were
+not safe to rewrite. Hash options describing the original ciphertext are
+removed from rewritten packet records; packet comments and other options stay.
+
+The output is written atomically. Errors or normal Ctrl-C remove the partial
+file and preserve an earlier completed output. The input capture is left alone.
+The JSON report defaults to the text output name plus `.json`, or the capture
+output name plus `.json` when only a capture filename is supplied.
 
 ## Python callers
 
