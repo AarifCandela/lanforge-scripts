@@ -214,22 +214,38 @@ def lock_workspace(stream):
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
-def workspace_identity(storage):
+def valid_user_db_prefix(value):
+    """Accept a short workspace label, never a path or a glob expression."""
+    if value is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+        raise ValueError("User DB prefix must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit.")
+    return value
+
+
+def workspace_prefix(user_db_prefix=None):
+    """Group named jobs while TemporaryDirectory still makes each run unique."""
+    valid_user_db_prefix(user_db_prefix)
+    return WORKSPACE_PREFIX + (user_db_prefix + "_" if user_db_prefix is not None else "")
+
+
+def workspace_identity(storage, user_db_prefix=None):
     """Identify our workspace without putting any session keys in its marker."""
-    return {"tool": "lf_wifi_decrypt", "version": 1, "storage": storage,
-            "user": getpass.getuser(), "uid": os.getuid() if hasattr(os, "getuid") else None}
+    identity = {"tool": "lf_wifi_decrypt", "version": 1, "storage": storage,
+                "user": getpass.getuser(), "uid": os.getuid() if hasattr(os, "getuid") else None}
+    if user_db_prefix is not None:
+        identity["user_db_prefix"] = valid_user_db_prefix(user_db_prefix)
+    return identity
 
 
 @contextmanager
-def temporary_workspace(storage):
+def temporary_workspace(storage, user_db_prefix=None):
     """Keep the workspace locked through child/store cleanup; close before removal."""
-    with tempfile.TemporaryDirectory(prefix=WORKSPACE_PREFIX) as directory:
+    with tempfile.TemporaryDirectory(prefix=workspace_prefix(user_db_prefix)) as directory:
         root = Path(directory)
         with (root / WORKSPACE_LOCK).open("xb+") as guard:
             guard.write(b"0")
             guard.flush()
             lock_workspace(guard)
-            (root / WORKSPACE_MARKER).write_text(json.dumps(workspace_identity(storage)), encoding="utf-8")
+            (root / WORKSPACE_MARKER).write_text(json.dumps(workspace_identity(storage, user_db_prefix)), encoding="utf-8")
             yield root
 
 
@@ -265,7 +281,7 @@ def workspace_files(root):
     return files, profiles
 
 
-def sqlite_workspace(root):
+def sqlite_workspace(root, user_db_prefix=None):
     """Recognize marked caches, or old Unix caches with a valid SQLite header.
 
     Old releases have no marker/lock: the operator must ensure they are idle.
@@ -278,7 +294,9 @@ def sqlite_workspace(root):
     if marker.exists():
         if not owned_plain_path(marker) or marker.stat().st_size > 1024:
             return False
-        return json.loads(marker.read_text(encoding="utf-8")) == workspace_identity("sqlite")
+        return json.loads(marker.read_text(encoding="utf-8")) == workspace_identity("sqlite", user_db_prefix)
+    if user_db_prefix is not None:
+        return False  # Unmarked legacy caches cannot establish a named group.
     database = root / "frames.sqlite"
     if os.name == "nt" or not owned_plain_path(database):
         return False
@@ -286,19 +304,20 @@ def sqlite_workspace(root):
         return stream.read(16) == b"SQLite format 3\0"
 
 
-def purge_sqlite_workspaces(temp_root=None):
+def purge_sqlite_workspaces(temp_root=None, *, user_db_prefix=None):
     """Remove recognized abandoned SQLite workspaces, never user output files.
 
     Scan the current temp root only. Lock every candidate before removing any;
     a busy cache aborts the purge. Locks protect current releases, not legacy
     unmarked caches. Run this maintenance operation when decoding is idle.
     """
+    prefix = workspace_prefix(user_db_prefix)
     parent = Path(temp_root if temp_root is not None else tempfile.gettempdir()).resolve(strict=True)
     removed, skipped, candidates = [], [], []
     with ExitStack() as guards:
-        for root in sorted(parent.glob(WORKSPACE_PREFIX + "*")):
+        for root in sorted(parent.glob(prefix + "*")):
             try:
-                if not sqlite_workspace(root):
+                if not sqlite_workspace(root, user_db_prefix):
                     skipped.append(root.name)
                     continue
                 workspace_files(root)
@@ -660,7 +679,7 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                     decrypted_only=False, output=None, report_path=None,
                     tshark="tshark", timeout=120, key_batch_size=64,
                     interfaces=(), resources=(), progress=None, output_stream=None,
-                    storage="sqlite", remove_beamforming=False):
+                    storage="sqlite", remove_beamforming=False, user_db_prefix=None):
     """Decode a capture and return a JSON-compatible verification report.
 
     Supply an output path for decoded text, or output_stream for a text stream.
@@ -701,6 +720,7 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
         raise ValueError("Key batch size must be between 1 and 64.")
     if storage not in ("sqlite", "memory"):
         raise ValueError("Storage must be sqlite or memory.")
+    valid_user_db_prefix(user_db_prefix)
     # Gather the whole key history. A reconnect does not invalidate earlier
     # keys: earlier frames in this same capture still need them.
     tks, pmks, warnings = [], [], []
@@ -718,7 +738,7 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
     batches = [keys[start:start + key_batch_size] for start in range(0, len(keys), key_batch_size)]
     digest = file_sha256(pcap)
     notify = progress or (lambda event: None)
-    with temporary_workspace(storage) as root:
+    with temporary_workspace(storage, user_db_prefix) as root:
         store = None
         try:
             store = MemoryFrameStore() if storage == "memory" else SqliteFrameStore(root / "frames.sqlite")
@@ -757,6 +777,7 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
             report = {
                 "pcap": str(pcap.resolve()), "sha256": digest,
                 "storage": storage,
+                "user_db_prefix": user_db_prefix,
                 "key_source": source, "key_count": len(keys),
                 "key_types": dict(Counter(kind for kind, _ in keys)),
                 "key_batch_size": key_batch_size, "key_batches": len(batches),
@@ -801,6 +822,8 @@ def parse_args(argv=None):
     parser.add_argument("--pcap", type=Path)
     parser.add_argument("--purge_sqlite", action="store_true",
                         help="Remove recognized abandoned SQLite workspaces from the current temp directory; run only when decoding is idle")
+    parser.add_argument("--user-db-prefix", type=valid_user_db_prefix,
+                        help="Group temporary workspaces and scope purge to this label; each run still gets a unique directory")
     parser.add_argument("--events", action="append", default=[], type=Path,
                         help="Matching Wi-Fi events or supplicant log; repeat for multiple files")
     parser.add_argument("--tk", action="append", default=[], type=valid_tk,
@@ -856,7 +879,7 @@ def main(argv=None):
 
     try:
         if args.purge_sqlite:
-            result = purge_sqlite_workspaces()
+            result = purge_sqlite_workspaces(user_db_prefix=args.user_db_prefix)
             print(f"Removed {len(result['removed'])} SQLite workspace(s) from {result['temp_root']}. "
                   f"Skipped {len(result['skipped'])} unrecognized or non-SQLite workspace(s).")
             return 0
@@ -870,6 +893,7 @@ def main(argv=None):
             output_stream=sys.stdout if args.output is None else None,
             storage=args.storage,
             remove_beamforming=args.remove_beamforming,
+            user_db_prefix=args.user_db_prefix,
         )
         for warning in report["warnings"][:20]:
             print("Warning: " + warning, file=sys.stderr)
