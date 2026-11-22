@@ -22,6 +22,7 @@ NOTES:      Requires Python 3.8+ and TShark with the "tk" key type.
             The report verifies frames; it does not label reconnect sessions.
             Text time is epoch seconds. Brief output includes radio metadata
             and Action fields; --remove_beamforming hides HE/EHT/VHT reports.
+            --anonymous replaces MAC addresses with stable labels in brief text.
 
             Python callers can import decrypt_capture without running the CLI.
 """
@@ -93,6 +94,9 @@ COLUMNS = ('"No.","%m","Time","%t","Source","%s",'
            '"Category","%Cus:wlan.fixed.category_code","EHT Action","%Cus:wlan.eht.action",'
            '"HE Action","%Cus:wlan.he.action","VHT Action","%Cus:wlan.vht.action"')
 BEAMFORMING_FILTER = "!(wlan.eht.action == 0 || wlan.he.action == 0 || wlan.vht.action == 0)"
+# Match six hex byte pairs, without taking a substring of an IPv6/EUI-64 address.
+MAC_ADDRESS = re.compile(r"(?<![0-9a-fA-F:\-])([0-9a-fA-F]{2})([:\-])"
+                         r"(?:[0-9a-fA-F]{2}\2){4}[0-9a-fA-F]{2}(?![0-9a-fA-F:\-])")
 EVENT_RECORD = re.compile(r"^wifi_event\s+(\S+)\s+\S+\s+\S+\s+'(.*)'$")
 KEY_EVENT = re.compile(r"WPA:\s*(PMK|PTK|TK|GTK)\s+([0-9a-fA-F]+)\s*$")
 SCOPE = re.compile(r"(?:(?<![\d.])(\d{1,3}\.\d{1,3}):\s+)?IFNAME=(\S+)")
@@ -974,17 +978,50 @@ def write_capture(pcap, path, store, digest):
     return stats
 
 
-def write_text(store, path, stream):
+class MacAnonymizer:
+    """Keep one in-memory MAC-to-label map for a single text output.
+
+    Apply this after frame ordering and filtering so key batches and storage
+    choice do not change labels. Never export the original-address mapping.
+    """
+
+    def __init__(self):
+        self.labels = {}
+
+    def replace(self, text):
+        """Replace every colon/hyphen MAC, including addresses in Info text."""
+        def label(match):
+            address = match.group().replace(":", "").replace("-", "").lower()
+            if address not in self.labels:
+                # Continue after Z with AA, AB, ... for captures with many peers.
+                number, name = len(self.labels) + 1, ""
+                while number:
+                    number, remainder = divmod(number - 1, 26)
+                    name = chr(ord("A") + remainder) + name
+                self.labels[address] = name
+            return self.labels[address]
+
+        return MAC_ADDRESS.sub(label, text)
+
+
+def write_text(store, path, stream, anonymous=False):
     """Write stored records in capture order to a stream or replace a text file.
 
     Build file output beside its destination and rename it only when complete.
     A caller-supplied stream is written directly and remains open for its owner.
+    Return the number of distinct MACs replaced, without returning the mapping.
     """
+    anonymizer = MacAnonymizer() if anonymous else None
+
+    def records():
+        for body in store.iter_text():
+            yield anonymizer.replace(body) if anonymizer is not None else body
+
     if path is None:
         if stream is not None:
-            for body in store.iter_text():
+            for body in records():
                 stream.write(body)
-        return
+        return len(anonymizer.labels) if anonymizer is not None else 0
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -992,12 +1029,13 @@ def write_text(store, path, stream):
                                          dir=path.parent, prefix=".lf_wifi_decrypt_",
                                          delete=False) as output:
             temporary = Path(output.name)
-            for body in store.iter_text():
+            for body in records():
                 output.write(body)
         temporary.replace(path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+    return len(anonymizer.labels) if anonymizer is not None else 0
 
 
 def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=None,
@@ -1006,7 +1044,7 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                     tshark="tshark", timeout=120, key_batch_size=64,
                     interfaces=(), resources=(), progress=None, output_stream=None,
                     storage="sqlite", remove_beamforming=False, user_db_prefix=None,
-                    decrypted_pcap=None):
+                    decrypted_pcap=None, anonymous=False):
     """Decode a capture and return a JSON-compatible verification report.
 
     Supply an output path for decoded text, or output_stream for a text stream.
@@ -1031,6 +1069,9 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
     decoded CCMP data payloads. It needs TShark Lua and uncompressed pcap/pcapng
     input. Unsupported/unknown frames stay unchanged; inspect the returned
     decrypted_capture counts to distinguish text decoding from capture export.
+
+    anonymous replaces MAC addresses with per-call A, B, ... labels in brief
+    packet text. It does not anonymize captures, reports or diagnostic messages.
     """
     pcap = Path(pcap)
     if isinstance(events, (str, Path)):
@@ -1047,6 +1088,8 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
         raise ValueError("Capture file does not exist.")
     if mode not in ("brief", "verbose"):
         raise ValueError("Output mode must be brief or verbose.")
+    if anonymous and mode != "brief":
+        raise ValueError("Anonymous output requires brief mode.")
     if timeout <= 0:
         raise ValueError("Timeout must be positive.")
     if not 1 <= key_batch_size <= MAX_KEYS_PER_PASS:
@@ -1133,7 +1176,8 @@ def decrypt_capture(pcap, *, events=(), temporal_keys=(), ssid=None, password=No
                 "text_frames_written": store.text_count(),
                 "text_reassembly_scope": "Per key batch; cross-batch stream reassembly is not combined",
             }
-            write_text(store, output, output_stream)
+            report["anonymous"] = bool(anonymous)
+            report["anonymous_mac_count"] = write_text(store, output, output_stream, anonymous)
             if decrypted_pcap is not None:
                 capture = write_capture(pcap, decrypted_pcap, store, digest)
                 capture["path"] = str(decrypted_pcap.resolve())
@@ -1187,6 +1231,8 @@ def parse_args(argv=None):
     parser.add_argument("--resource", action="append", default=[],
                         help="Keep keys from this resource, e.g. 1.1; requires resource-tagged logs")
     parser.add_argument("--mode", choices=("brief", "verbose"), default="brief")
+    parser.add_argument("--anonymous", action="store_true",
+                        help="Replace MAC addresses in brief packet text with stable A, B, ... labels")
     parser.add_argument("--filter", help="Display filter for text; verification scans the full capture")
     parser.add_argument("--remove_beamforming", action="store_true",
                         help="Exclude HE/EHT/VHT compressed beamforming/CQI reports from text; combines with --filter")
@@ -1211,6 +1257,8 @@ def parse_args(argv=None):
             parser.error("Use --purge_sqlite by itself, without capture/key/output arguments.")
     elif args.pcap is None:
         parser.error("--pcap is required for decoding.")
+    if args.anonymous and args.mode != "brief":
+        parser.error("--anonymous requires --mode brief.")
     if args.output is not None and args.report is None:
         args.report = Path(str(args.output) + ".json")
     elif args.decrypted_pcap is not None and args.report is None:
@@ -1251,6 +1299,7 @@ def main(argv=None):
             remove_beamforming=args.remove_beamforming,
             user_db_prefix=args.user_db_prefix,
             decrypted_pcap=args.decrypted_pcap,
+            anonymous=args.anonymous,
         )
         for warning in report["warnings"][:20]:
             print("Warning: " + warning, file=sys.stderr)

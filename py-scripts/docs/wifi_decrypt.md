@@ -46,6 +46,33 @@ final summary remain. Imported callers receive commands through the optional
 progress callback and control their own logging. Python callers select this
 filter with `remove_beamforming=True` in `decrypt_capture()`.
 
+## Anonymous brief output
+
+Use `--anonymous` to replace MAC addresses in brief packet text with labels:
+
+```sh
+python3 lf_wifi_decrypt.py --pcap capture.pcapng --events wifi_events.txt --anonymous -o anonymous.txt
+python3 lf_wifi_decrypt.py --pcap capture.pcapng --events wifi_events.txt --anonymous --remove_beamforming --no-sqlite -o anonymous.txt
+```
+
+The first MAC in the final filtered output becomes `A`, the next becomes `B`,
+and repeated addresses keep their label, including inside the Info column.
+After `Z`, labels continue as `AA`, `AB`, and so on. Matching ignores case and
+accepts six hex byte pairs separated by colons or hyphens; both forms of the
+same address share a label. Broadcast and multicast addresses are replaced too.
+Short hex values and IPv6 addresses are left alone.
+
+One mapping is kept in RAM for the current output and discarded afterward.
+Both storage modes assign labels in capture order, after filtering and key-batch
+deduplication. A new call starts again at `A`; changing the filter can change
+the labels. Reports record `anonymous` and `anonymous_mac_count`, without
+exporting the original-address mapping. Python callers use `anonymous=True`.
+Combining this option with `--mode verbose` is rejected.
+
+This masks MAC addresses in packet text only. It leaves input captures/events,
+IP addresses, SSIDs and payload text unchanged. JSON reports and diagnostic
+messages are not anonymized; review those separately before sharing.
+
 ## Storage and cleanup
 
 By default `--storage sqlite` keeps frame metadata and decoded text in an
