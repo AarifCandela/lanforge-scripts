@@ -1240,7 +1240,7 @@ def parse_args(argv=None):
     parser.add_argument("-o", "--output", type=Path, help="Decoded text; default is standard output")
     parser.add_argument("--report", type=Path, help="JSON report; defaults to the text/capture output name plus .json")
     parser.add_argument("--decrypted-pcap", type=Path,
-                        help="Write every original packet, replacing supported decoded data payloads; requires TShark Lua and uncompressed pcap/pcapng input")
+                        help="Save all packets, decrypting supported CCMP data and unicast management bodies; retains MAC addresses and requires TShark Lua")
     parser.add_argument("--tshark", default="tshark")
     parser.add_argument("--timeout", type=float, default=120, help="Timeout per TShark invocation")
     parser.add_argument("--key-batch-size", type=int, default=64, help="Keys per pass, from 1 to 64")

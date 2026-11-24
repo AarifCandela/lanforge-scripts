@@ -13,6 +13,17 @@ python3 lf_wifi_decrypt.py --pcap capture.pcapng --events wifi_events.txt --mode
 python3 lf_wifi_decrypt.py --pcap capture.pcapng --events resource1.txt --events resource2.txt -o combined.txt
 ```
 
+To use a job-specific cache label, save a decrypted capture and mask MACs in
+brief text in the same run:
+
+```sh
+python3 lf_wifi_decrypt.py --pcap capture.pcapng --events wifi_events.txt --user-db-prefix overnight --decrypted-pcap decoded.pcapng --anonymous -o summary.txt
+```
+
+`--anonymous` applies to the text only. The saved capture retains the original
+MAC addresses and Wi-Fi/radiotap headers. Text filters, including
+`--remove_beamforming`, do not remove packets from the saved capture.
+
 The report defaults to `OUTPUT.json`. Exit status is 0 when some new
 decryption is verified, 2 when none is verified, and 1 on a processing error.
 Check `protected_data_remaining` to distinguish partial from complete decoding.
